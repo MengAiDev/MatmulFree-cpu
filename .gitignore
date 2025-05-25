@@ -1,2 +1,9 @@
 venv/
 mmfreelm.egg-info/
+build/
+dist/
+mmfreelm/__pycache__
+mmfreelm/layers/__pycache__
+mmfreelm/models/__pycache__
+mmfreelm/modules/__pycache__
+mmfreelm/models/hgrn_bit/__pycache__
