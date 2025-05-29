@@ -7,3 +7,5 @@ mmfreelm/layers/__pycache__
 mmfreelm/models/__pycache__
 mmfreelm/modules/__pycache__
 mmfreelm/models/hgrn_bit/__pycache__
+mmfreelm/ops/__pycache__
+mmfreelm/ops/hgrn/__pycache__
