@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+from .configuration_hgrn_bit import HGRNBitConfig
+from .modeling_hgrn_bit import HGRNBitForCausalLM, HGRNBitModel
 
-from mmfreelm.models.hgrn_bit.configuration_hgrn_bit import HGRNBitConfig
-from mmfreelm.models.hgrn_bit.modeling_hgrn_bit import HGRNBitForCausalLM, HGRNBitModel
+from transformers import AutoConfig, AutoModelForCausalLM
 
-AutoConfig.register(HGRNBitConfig.model_type, HGRNBitConfig)
-AutoModel.register(HGRNBitConfig, HGRNBitModel)
+AutoConfig.register("hgrn_bit", HGRNBitConfig)
 AutoModelForCausalLM.register(HGRNBitConfig, HGRNBitForCausalLM)
 
 
-__all__ = ['HGRNBitConfig', 'HGRNBitForCausalLM', 'HGRNBitModel']
+__all__ = [
+    "HGRNBitConfig",
+    "HGRNBitForCausalLM",
+    "HGRNBitModel"
+]

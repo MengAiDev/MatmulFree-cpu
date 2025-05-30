@@ -2,6 +2,8 @@
 
 # Copyright (c) 2023, Tri Dao.
 
+# edited by MengAiDev, 2025
+
 from typing import Tuple
 
 import torch

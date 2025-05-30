@@ -14,6 +14,7 @@ from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+from transformers.generation.utils import GenerationMixin
 
 from mmfreelm.layers.hgrn_bit import HGRNBitAttention
 from mmfreelm.models.hgrn_bit.configuration_hgrn_bit import HGRNBitConfig
@@ -278,7 +279,8 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
         )
 
 
-class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
+class HGRNBitForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = HGRNBitConfig
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
@@ -309,19 +311,7 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
         return self.model
 
     def generate(self, *args, **kwargs):
-        try:
-            return super().generate(*args, **kwargs)
-        except AttributeError as exception:
-            if 'past_key_values' in str(exception):
-                raise AttributeError(
-                    f"You tried to call `generate` with a decoding strategy that manipulates `past_key_values`, "
-                    f"which is not supported for {self.__class__.__name__}. "
-                    f"Try another generation strategy instead. "
-                    f"For the available generation strategies, check this doc: "
-                    f"https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
-                )
-            else:
-                raise exception
+        return GenerationMixin.generate(self, *args, **kwargs)
 
     def prepare_inputs_for_generation(
         self,

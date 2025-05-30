@@ -2,287 +2,173 @@
 
 # Copyright (c) 2024, Yu Zhang, Songlin Yang
 
-# this function implements the chunkwise form of HGRN, inspired by
-# [Volodymyr Kyrylov in his blog post](https://proger.github.io/posts/scan/chunk.html)
-# also refer to the `accelerated-scan` lib: https://github.com/proger/accelerated-scan
+# edited by MengAiDev, 2025
 
-# from tests on H800, with B, H, D = 16, 4, 128, we see that the chunk can be greatly faster than the recurrent:
-#
-# Performance:
-#    seq_len     chunk  recurrent  chunk_bwd  recurrent_bwd
-# 0    128.0  0.039360   0.061056   0.312160       0.205008
-# 1    256.0  0.045824   0.123712   0.308784       0.297696
-# 2    512.0  0.058688   0.241952   0.310720       0.626528
-# 3   1024.0  0.088288   0.476992   0.313184       1.333152
-# 4   2048.0  0.169472   0.943264   0.452464       2.724864
-# 5   4096.0  0.329920   1.886144   0.881600       5.551520
-# 6   8192.0  0.647872   3.755040   1.740496      11.117184
-# 7  16384.0  1.272064   7.520576   3.446608      22.362528
+# Benchmark results on 4 core AMD EPYC 7763 64-Core Processor
+
+# Benchmarking CPU implementation...
+# Sequence Length Chunk Fwd (ms)  Chunk Bwd (ms) 
+# 128             13.11           20.20          
+# 256             28.95           31.76          
+# 512             54.14           62.64          
+# 1024            114.02          125.12         
+# 2048            239.29          255.63         
+# 4096            511.81          551.23         
+# 8192            1014.24         1035.15        
+
 
 from typing import Tuple
-
 import torch
-import triton
-import triton.language as tl
+import torch.nn.functional as F
+from torch.autograd import Function
 
-from mmfreelm.utils import contiguous
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BD': 32}, num_warps=1),
-        triton.Config({'BD': 32}, num_warps=2),
-        triton.Config({'BD': 32}, num_warps=4),
-        triton.Config({'BD': 32}, num_warps=8),
-        triton.Config({'BD': 64}, num_warps=1),
-        triton.Config({'BD': 64}, num_warps=2),
-        triton.Config({'BD': 64}, num_warps=4),
-        triton.Config({'BD': 64}, num_warps=8),
-        triton.Config({'BD': 128}, num_warps=1),
-        triton.Config({'BD': 128}, num_warps=2),
-        triton.Config({'BD': 128}, num_warps=4),
-        triton.Config({'BD': 128}, num_warps=8),
-    ],
-    key=['D']
-)
-@triton.jit
-def chunk_hgrn_fwd_kernel_h(
-    x,
-    g,
-    gc,
-    o,
-    h0,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr
-):
-    i_d, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    o_d = i_d * BD + tl.arange(0, BD)
-    mask = o_d < D
-
-    p_x = x + i_bh * T * D + i_t * BT * D + o_d
-    p_g = g + i_bh * T * D + i_t * BT * D + o_d
-    p_gc = gc + i_bh * T * D + i_t * BT * D + o_d
-    p_o = o + i_bh * T * D + i_t * BT * D + o_d
-
-    b_h = tl.zeros([BD], dtype=tl.float32)
-    b_gc = tl.zeros([BD], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        if i_t == 0:
-            b_h += tl.load(h0 + i_bh * D + o_d, mask=mask, other=0).to(tl.float32)
-    for i in range(0, BT):
-        mask_t = mask & ((i_t * BT + i) < T)
-        b_x = tl.load(p_x, mask=mask_t, other=0).to(tl.float32)
-        b_g = tl.load(p_g, mask=mask_t, other=0).to(tl.float32)
-        b_h = tl.exp(b_g) * b_h + b_x
-        b_gc = b_gc + b_g
-        tl.store(p_gc, b_gc.to(p_o.dtype.element_ty), mask=mask_t)
-        tl.store(p_o, b_h.to(p_o.dtype.element_ty), mask=mask_t)
-
-        p_x += D
-        p_g += D
-        p_gc += D
-        p_o += D
-
-
-@triton.jit
-def chunk_hgrn_fwd_kernel_o(
-    gc,
-    o,
-    s_h,
-    s_t,
-    s_d,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr
-):
-    i_d, i_bh = tl.program_id(0), tl.program_id(1)
-    o_d = i_d * BD + tl.arange(0, BD)
-    mask = o_d < D
-
-    for i_t in range(1, tl.cdiv(T, BT)):
-        p_gc = tl.make_block_ptr(gc + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-        p_o = tl.make_block_ptr(o + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-
-        # [BD,]
-        b_h0 = tl.load(o + i_bh * T * D + i_t * BT * D - D + o_d, mask=mask, other=0).to(tl.float32)
-        # [BT, BD]
-        b_gc = tl.load(p_gc, boundary_check=(0, 1)).to(tl.float32)
-        b_o = tl.load(p_o, boundary_check=(0, 1)).to(tl.float32)
-        b_o = b_o + tl.exp(b_gc) * b_h0[None, :]
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BD': 32}, num_warps=1),
-        triton.Config({'BD': 32}, num_warps=2),
-        triton.Config({'BD': 32}, num_warps=4),
-        triton.Config({'BD': 32}, num_warps=8),
-        triton.Config({'BD': 64}, num_warps=1),
-        triton.Config({'BD': 64}, num_warps=2),
-        triton.Config({'BD': 64}, num_warps=4),
-        triton.Config({'BD': 64}, num_warps=8),
-        triton.Config({'BD': 128}, num_warps=1),
-        triton.Config({'BD': 128}, num_warps=2),
-        triton.Config({'BD': 128}, num_warps=4),
-        triton.Config({'BD': 128}, num_warps=8),
-    ],
-    key=['D']
-)
-@triton.jit
-def chunk_hgrn_bwd_kernel_h(
-    g,
-    gc,
-    dx,
-    do,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr
-):
-    i_d, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    o_d = i_d * BD + tl.arange(0, BD)
-    mask = o_d < D
-    BC = min(BT, T - i_t * BT)
-    NT = tl.num_programs(1)
-
-    p_g = g + (i_bh * T + i_t * BT + BC - 1) * D + o_d
-    p_gc = gc + (i_bh * T + i_t * BT + BC - 1) * D + o_d
-    p_dx = dx + (i_bh * T + i_t * BT + BC - 1) * D + o_d
-    p_do = do + (i_bh * T + i_t * BT + BC - 1) * D + o_d
-
-    if i_t == NT - 1:
-        b_gc = tl.zeros([BD], dtype=tl.float32)
-    else:
-        b_gc = tl.load(g + (i_bh * T + i_t * BT + BT) * D + o_d, mask=mask, other=0).to(tl.float32)
-    b_dh = tl.zeros([BD], dtype=tl.float32)
-    for _ in range(BC - 1, -1, -1):
-        tl.store(p_gc, b_gc.to(p_gc.dtype.element_ty), mask=mask)
-
-        b_g = tl.load(p_g, mask=mask, other=0).to(tl.float32)
-        b_do = tl.load(p_do, mask=mask, other=0).to(tl.float32)
-
-        b_gc = b_gc + b_g
-        b_dh = b_dh + b_do
-        b_dx = b_dh
-        b_dh = b_dh * tl.exp(b_g)
-
-        tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), mask=mask)
-
-        p_g -= D
-        p_gc -= D
-        p_dx -= D
-        p_do -= D
-
-
-@triton.jit
-def chunk_hgrn_bwd_kernel_o(
-    g,
-    gc,
-    o,
-    dx,
-    dg,
-    s_h,
-    s_t,
-    s_d,
-    T: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr
-):
-    i_d, i_bh = tl.program_id(0), tl.program_id(1)
-    o_d = i_d * BD + tl.arange(0, BD)
-    mask = o_d < D
-
-    for i_t in range(tl.cdiv(T, BT) - 1, -1, -1):
-        p_g = tl.make_block_ptr(g + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-        p_gc = tl.make_block_ptr(gc + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-        p_o = tl.make_block_ptr(o + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT - 1, i_d * BD), (BT, BD), (1, 0))
-        p_dx = tl.make_block_ptr(dx + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-        p_dg = tl.make_block_ptr(dg + i_bh * s_h, (T, D), (s_t, s_d), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-
-        # [BD,]
-        mask_t = mask & ((i_t + 1) * BT < T)
-        b_ht = tl.load(dx + i_bh * T * D + (i_t + 1) * BT * D + o_d, mask=mask_t, other=0).to(tl.float32)
-        # [BT, BD]
-        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-        b_gc = tl.load(p_gc, boundary_check=(0, 1)).to(tl.float32)
-        b_o = tl.load(p_o, boundary_check=(0, 1)).to(tl.float32)
-        b_dx = tl.load(p_dx, boundary_check=(0, 1)).to(tl.float32)
-        b_dg = tl.load(p_dg, boundary_check=(0, 1)).to(tl.float32)
-        b_dx = b_dx + tl.exp(b_gc) * b_ht[None, :]
-        b_dg = b_o * b_dx * tl.exp(b_g)
-        tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0, 1))
-
-
-class ChunkHGRNFunction(torch.autograd.Function):
-
+class ChunkHGRNFunction(Function):
     @staticmethod
-    @contiguous
     def forward(ctx, x, g, initial_state=None, output_final_state=False):
         B, H, T, D = x.shape
-        BT, BD = 128, min(64, triton.next_power_of_2(D))
-        num_warps = 8 if BD == 64 else 4
-
-        gc = torch.empty_like(g, dtype=torch.float)
-        o = torch.empty_like(x, dtype=torch.float)
-        def grid(meta): return (triton.cdiv(D, meta['BD']), triton.cdiv(T, meta['BT']), B * H)
-        chunk_hgrn_fwd_kernel_h[grid](
-            x, g, gc, o, initial_state,
-            T, D,
-            BT=BT,
-            USE_INITIAL_STATE=initial_state is not None
-        )
-        def grid(meta): return (triton.cdiv(D, meta['BD']), B * H)
-        chunk_hgrn_fwd_kernel_o[grid](
-            gc, o,
-            o.stride(1), o.stride(2), o.stride(3),
-            T, D,
-            BT=BT, BD=BD,
-            num_warps=num_warps
-        )
-        final_state = None
-        if output_final_state:
-            final_state = o[:, :, -1].clone()
+        BT = 128  # 分块大小
+        
+        # 初始化输出和g的累积
+        o = torch.zeros_like(x, dtype=torch.float32)
+        gc = torch.zeros_like(g, dtype=torch.float32)
+        
+        # 如果没有初始状态，初始化为零
+        h = torch.zeros(B, H, D, dtype=torch.float32, device=x.device)
+        if initial_state is not None:
+            h = initial_state.clone()
+        
+        num_chunks = (T + BT - 1) // BT
+        chunk_final_states = torch.zeros(B, H, num_chunks, D, dtype=torch.float32, device=x.device)
+        
+        # 第一遍：处理每个块内部
+        for i in range(num_chunks):
+            start = i * BT
+            end = min((i+1)*BT, T)
+            chunk_len = end - start
+            
+            # 获取当前块的数据
+            x_chunk = x[:, :, start:end, :]
+            g_chunk = g[:, :, start:end, :]
+            
+            # 初始化当前块的隐藏状态和g累积
+            h_chunk = torch.zeros(B, H, chunk_len, D, dtype=torch.float32, device=x.device)
+            gc_chunk = torch.zeros(B, H, chunk_len, D, dtype=torch.float32, device=x.device)
+            
+            # 处理块内每个时间步
+            for t in range(chunk_len):
+                prev_h = h if t == 0 else h_chunk[:, :, t-1, :]
+                h_current = torch.exp(g_chunk[:, :, t, :]) * prev_h + x_chunk[:, :, t, :]
+                gc_current = g_chunk[:, :, t, :] if t == 0 else gc_chunk[:, :, t-1, :] + g_chunk[:, :, t, :]
+                
+                h_chunk[:, :, t, :] = h_current
+                gc_chunk[:, :, t, :] = gc_current
+            
+            # 保存当前块的输出和g累积
+            o[:, :, start:end, :] = h_chunk
+            gc[:, :, start:end, :] = gc_chunk
+            chunk_final_states[:, :, i, :] = h_chunk[:, :, -1, :]
+            
+            # 重置下一个块的初始状态
+            h = torch.zeros(B, H, D, dtype=torch.float32, device=x.device)
+        
+        # 第二遍：跨块修正
+        if num_chunks > 1:
+            for i in range(1, num_chunks):
+                start = i * BT
+                end = min((i+1)*BT, T)
+                chunk_len = end - start
+                
+                # 获取前一个块的最终状态
+                prev_final = o[:, :, start-1, :]
+                gc_chunk = gc[:, :, start:end, :]
+                
+                # 应用修正
+                correction = prev_final.unsqueeze(2) * torch.exp(gc_chunk)
+                o[:, :, start:end, :] += correction
+        
+        # 处理最终状态
+        final_state = o[:, :, -1, :].clone() if output_final_state else None
         o = o.to(x.dtype)
-        ctx.save_for_backward(g, o, initial_state)
+        
+        # 保存反向传播所需变量
+        ctx.save_for_backward(g, o, gc)
+        ctx.initial_state = initial_state
         return o, final_state
 
     @staticmethod
-    @contiguous
-    def backward(ctx, do, dht=None):
-        g, o, initial_state = ctx.saved_tensors
+    def backward(ctx, do, d_final_state=None):
+        g, o, gc = ctx.saved_tensors
         B, H, T, D = do.shape
-        BT, BD = 128, min(64, triton.next_power_of_2(D))
-        num_warps = 8 if BD == 64 else 4
-
-        gc = torch.empty_like(g, dtype=torch.float)
-        dx = torch.empty_like(o)
-        dg = torch.empty_like(g)
-        def grid(meta): return (triton.cdiv(D, meta['BD']), triton.cdiv(T, meta['BT']), B * H)
-        chunk_hgrn_bwd_kernel_h[grid](
-            g, gc, dx, do,
-            T, D,
-            BT=BT
-        )
-        def grid(meta): return (triton.cdiv(D, meta['BD']), B * H)
-        chunk_hgrn_bwd_kernel_o[grid](
-            g, gc, o, dx, dg,
-            o.stride(1), o.stride(2), o.stride(3),
-            T, D,
-            BT=BT, BD=BD,
-            num_warps=num_warps
-        )
-        if initial_state is not None:
-            dg[:, :, 0] = initial_state * dx[:, :, 0] * g[:, :, 0].exp()
-
-        return dx, dg, None, None
-
+        BT = 128
+        num_chunks = (T + BT - 1) // BT
+        
+        # 初始化梯度
+        dx = torch.zeros_like(o, dtype=torch.float32)
+        dg = torch.zeros_like(g, dtype=torch.float32)
+        
+        # 处理最终状态的梯度
+        if d_final_state is not None:
+            do = do.clone()
+            do[:, :, -1, :] += d_final_state
+        
+        # 初始化反向传播的隐藏状态
+        dh_next = torch.zeros(B, H, D, dtype=torch.float32, device=do.device)
+        
+        # 反向传播：跨块修正
+        for i in range(num_chunks-1, -1, -1):
+            start = i * BT
+            end = min((i+1)*BT, T)
+            chunk_len = end - start
+            
+            # 获取当前块的数据
+            do_chunk = do[:, :, start:end, :].float()
+            g_chunk = g[:, :, start:end, :].float()
+            o_chunk = o[:, :, start:end, :].float()
+            gc_chunk = gc[:, :, start:end, :].float()
+            
+            # 如果不是最后一个块，添加跨块梯度
+            if i < num_chunks - 1:
+                # 下一个块的第一个位置的dx
+                dx_next = dx[:, :, end, :]
+                # 应用到当前块的每个位置
+                do_chunk += dx_next.unsqueeze(2) * torch.exp(gc_chunk)
+            
+            # 当前块内部的反向传播
+            dx_chunk = torch.zeros_like(do_chunk)
+            dg_chunk = torch.zeros_like(g_chunk)
+            dh = dh_next.clone()
+            
+            # 从后向前处理块内时间步
+            for t in range(chunk_len-1, -1, -1):
+                # 计算当前梯度
+                dh += do_chunk[:, :, t, :]
+                dx_current = dh.clone()
+                
+                # 计算g的梯度
+                if t > 0:
+                    prev_o = o_chunk[:, :, t-1, :]
+                else:
+                    prev_o = o[:, :, start-1, :] if i > 0 else torch.zeros(B, H, D, device=o.device)
+                
+                dg_current = prev_o * dx_current * torch.exp(g_chunk[:, :, t, :])
+                
+                # 更新隐藏状态梯度
+                dh = dh * torch.exp(g_chunk[:, :, t, :])
+                
+                # 保存结果
+                dx_chunk[:, :, t, :] = dx_current
+                dg_chunk[:, :, t, :] = dg_current
+            
+            # 保存当前块的梯度
+            dx[:, :, start:end, :] = dx_chunk
+            dg[:, :, start:end, :] = dg_chunk
+            dh_next = dh.clone()
+        
+        # 处理初始状态的梯度
+        if ctx.initial_state is not None:
+            dg[:, :, 0, :] += ctx.initial_state * dx[:, :, 0, :] * torch.exp(g[:, :, 0, :])
+        
+        return dx.to(o.dtype), dg.to(g.dtype), None, None
 
 def chunk_hgrn(
     x: torch.Tensor,
@@ -295,79 +181,56 @@ def chunk_hgrn(
     o, final_state = ChunkHGRNFunction.apply(x, g, initial_state, output_final_state)
     return o, final_state
 
-
 if __name__ == '__main__':
-    import torch.nn.functional as F
-
-    from mmfreelm.ops.hgrn.naive import naive_recurrent_hgrn
-    from mmfreelm.ops.hgrn.recurrent_fuse import fused_recurrent_hgrn
-    B, H, T, D = 8, 4, 512, 128
-    dtype = torch.bfloat16
-    torch.manual_seed(42)
-    # [batch_size, n_heads, seq_len, d_head]
-    x = torch.randn((B, H, T, D), dtype=dtype, device='cuda')
-    g = torch.randn((B, H, T, D), dtype=dtype, device='cuda')
-    x, g = (1 - g.sigmoid()) * x, F.logsigmoid(g)
-    print(f'x:\t{float(x.min()):>10.6f}\t{float(x.max()):>10.6f}')
-    print(f'g:\t{float(g.min()):>10.6f}\t{float(g.max()):>10.6f}')
-    x, g = (i.detach().clone().to(dtype).requires_grad_() for i in (x, g))
-    print(f"DTYPE:\t{x.dtype}")
-    do = torch.randn_like(x)
-    h0 = torch.randn_like(x[:, :, 0])
-    ref, ref_ht = naive_recurrent_hgrn(x, g, h0, output_final_state=True)
-    ref.backward(do)
-    ref_dx, x.grad = x.grad.clone(), None
-    ref_dg, g.grad = g.grad.clone(), None
-
-    tri, tri_ht = fused_recurrent_hgrn(x, g, h0, output_final_state=True)
-    tri.backward(do)
-    tri_dx, x.grad = x.grad.clone(), None
-    tri_dg, g.grad = g.grad.clone(), None
-    print("  \t    DIFF\t    MAX")
-    print(' o\t', f"{float((ref - tri).abs().max()):>10.6f}\t{float(ref.max()):>10.6f}")
-    print('ht\t', f"{float((ref_ht[0] - tri_ht[0]).abs().max()):>10.6f}\t{float(ref.max()):>10.6f}")
-    print('dx\t', f"{float((ref_dx - tri_dx).abs().max()):>10.6f}\t{float(ref_dx.max()):>10.6f}")
-    print('dg\t', f"{float((ref_dg - tri_dg).abs().max()):>10.6f}\t{float(ref_dg.max()):>10.6f}")
-    print('Done!')
-
-    @triton.testing.perf_report(
-        triton.testing.Benchmark(
-            # argument names to use as an x-axis for the plot
-            x_names=['seq_len'],
-            # different possible values for `x_name`
-            x_vals=[128 * 2 ** i for i in range(0, 8)],
-            # argument name whose value corresponds to a different line in the plot
-            line_arg='provider',
-            # possible values for `line_arg``
-            line_vals=['chunk', 'recurrent', 'chunk_bwd', 'recurrent_bwd'],
-            # label name for the lines
-            line_names=['chunk', 'recurrent', 'chunk_bwd', 'recurrent_bwd'],
-            # line styles
-            styles=[('green', '-'), ('blue', '--'), ('red', '-.'), ('cyan', ':'), ('yellow', 'dotted'), ('black', 'dashed')],
-            ylabel="Execution Time (ms)",  # label name for the y-axis
-            # name for the plot. Used also as a file name for saving the plot.
-            plot_name="Performance",
-            args={},
-        )
-    )
-    def benchmark(seq_len, provider):
-        dtype = torch.bfloat16
-        B, H, D = 16, 4, 128
-
-        x = torch.randn((B, H, seq_len, D), dtype=dtype, device='cuda')
-        g = torch.randn((B, H, seq_len, D), dtype=dtype, device='cuda').sigmoid()
+    import time
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    B, H, D = 16, 4, 128
+    seq_lens = [128, 256, 512, 1024, 2048, 4096, 8192]
+    results = {
+        'chunk_fwd': [],
+        'chunk_bwd': [],
+    }
+    
+    print("Benchmarking CPU implementation...")
+    print(f"{'Sequence Length':<15} {'Chunk Fwd (ms)':<15} {'Chunk Bwd (ms)':<15}")
+    
+    for seq_len in seq_lens:
+        # 准备数据
+        x = torch.randn((B, H, seq_len, D), dtype=torch.bfloat16, device='cpu')
+        g = torch.randn((B, H, seq_len, D), dtype=torch.bfloat16, device='cpu').sigmoid()
         x = (1 - g) * x
-        x, g = (i.detach().clone().to(dtype).requires_grad_() for i in (x, g))
-        do = torch.randn_like(x, dtype=dtype)
-        quantiles = [0.5, 0.2, 0.8]
-        results = 0, 0, 0
-        if provider == 'chunk':
-            results = triton.testing.do_bench(lambda: chunk_hgrn(x, g), quantiles=quantiles)
-        if provider == 'recurrent':
-            results = triton.testing.do_bench(lambda: fused_recurrent_hgrn(x, g), quantiles=quantiles)
-        if provider == 'chunk_bwd':
-            results = triton.testing.do_bench(lambda: chunk_hgrn(x, g)[0].backward(do), quantiles=quantiles)
-        if provider == 'recurrent_bwd':
-            results = triton.testing.do_bench(lambda: fused_recurrent_hgrn(x, g)[0].backward(do), quantiles=quantiles)
-        return results
-    benchmark.run(print_data=True)
+        do = torch.randn_like(x, dtype=torch.bfloat16)
+        
+        # 预热
+        for _ in range(3):
+            x1, g1 = x.clone().requires_grad_(), g.clone().requires_grad_()
+            o, _ = chunk_hgrn(x1, g1)
+            o.backward(do)
+        
+        # 前向传播计时
+        fwd_time = 0.0
+        for _ in range(10):
+            x1, g1 = x.clone().requires_grad_(), g.clone().requires_grad_()
+            start = time.time()
+            o, _ = chunk_hgrn(x1, g1)
+            fwd_time += (time.time() - start) * 1000
+        fwd_time_avg = fwd_time / 10
+        
+        # 反向传播计时
+        bwd_time = 0.0
+        for _ in range(10):
+            x1, g1 = x.clone().requires_grad_(), g.clone().requires_grad_()
+            o, _ = chunk_hgrn(x1, g1)
+            
+            start = time.time()
+            o.backward(do)
+            bwd_time += (time.time() - start) * 1000
+        bwd_time_avg = bwd_time / 10
+        
+        # 记录结果
+        results['chunk_fwd'].append(fwd_time_avg)
+        results['chunk_bwd'].append(bwd_time_avg)
+        
+        print(f"{seq_len:<15} {fwd_time_avg:<15.2f} {bwd_time_avg:<15.2f}")

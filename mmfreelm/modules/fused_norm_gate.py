@@ -3,6 +3,8 @@
 # Copyright (c) 2023, Tri Dao.
 # Implement residual + RMSNorm with Swish gate on CPU.
 
+# edited by MengAiDev, 2025
+
 import math
 import torch
 import torch.nn as nn
