@@ -4,7 +4,8 @@ CPU MatmulFree LLM
 ## Quick Start
 
 ### Install
-Run:```bash
+Run:
+```bash
 git clone https://github.com/MengAiDev/MatmulFree-cpu
 cd MatmulFree-cpu
 pip install -e .
