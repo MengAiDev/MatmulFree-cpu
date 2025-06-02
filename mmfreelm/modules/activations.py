@@ -21,7 +21,7 @@ def swish(x):
 @torch.jit.script
 def bias_gelu(y, bias):
     x = bias + y
-    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))).to(dtype=y.dtype)
+    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))).to(dtype=y.dtype))
 
 
 # gradient of tanh approximation of gelu
@@ -63,7 +63,7 @@ bias_gelu_impl = GeLUFunction.apply
 # x * 0.5 * (1.0 + torch.erf(x * 0.70710678))
 @torch.jit.script
 def gelu_fwd(x):
-    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))).to(dtype=x.dtype)
+    return (x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))).to(dtype=x.dtype))
 
 
 # gradient of tanh approximation of gelu
@@ -112,71 +112,72 @@ def sqrelu_bwd(g, x):
     return (2.0 * g * F.relu(x)).to(dtype=x.dtype)
 
 
-swiglu_fwd_codestring = """
-template <typename T> T swiglu_fwd(T x, T y) {
-    return float(x) * float(y) / (1.0f + ::exp(-float(x)));
-}
-"""
-swiglu_bwd_codestring = """
-template <typename T> T swiglu_bwd(T x, T y, T g, T& dx, T& dy) {
-    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
-    dx = x_sigmoid * (1 + float(x) * (1.0f - x_sigmoid)) * float(g) * float(y);
-    dy = float(x) * x_sigmoid * float(g);
-}
-"""
-
-swiglu_bwd_with_output_codestring = """
-template <typename T> T swiglu_bwd_with_output(T x, T y, T g, T& dx, T& dy, T& z) {
-    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
-    float x_swish = float(x) * x_sigmoid;
-    dx = x_sigmoid * (1 + float(x) * (1.0f - x_sigmoid)) * float(g) * float(y);
-    dy = x_swish * float(g);
-    z = x_swish * float(y);
-}
-"""
-
-swiglu_fwd = torch.cuda.jiterator._create_jit_fn(swiglu_fwd_codestring)
-swiglu_bwd = torch.cuda.jiterator._create_multi_output_jit_fn(swiglu_bwd_codestring, num_outputs=2)
-swiglu_bwd_with_output = torch.cuda.jiterator._create_multi_output_jit_fn(swiglu_bwd_with_output_codestring, num_outputs=3)
-
-
+# 移除 Jiterator 实现，提供纯 PyTorch 的 SwiGLU 实现
 class SwiGLUFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x, y):
-        ctx.save_for_backward(x, y)
-        return swiglu_fwd(x, y)
+        # SwiGLU: x * SiLU(y)
+        sigmoid_y = torch.sigmoid(y)
+        z = x * sigmoid_y * y  # SiLU(y) = y * sigmoid(y)
+        ctx.save_for_backward(x, y, sigmoid_y)
+        return z
 
     @staticmethod
-    def backward(ctx, dout):
-        x, y = ctx.saved_tensors
-        return swiglu_bwd(x, y, dout)
+    def backward(ctx, grad_output):
+        x, y, sigmoid_y = ctx.saved_tensors
+        
+        # SiLU 的导数: d(SiLU(y))/dy = sigmoid(y) + y * sigmoid(y) * (1 - sigmoid(y))
+        silu_grad = sigmoid_y + y * sigmoid_y * (1 - sigmoid_y)
+        
+        # 计算梯度
+        grad_x = grad_output * sigmoid_y * y
+        grad_y = grad_output * x * silu_grad
+        
+        return grad_x, grad_y
 
 
 class SwiGLULinearFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x, y, weight, bias):
-        z = swiglu_fwd(x, y)
+        # 使用新的 SwiGLU 实现
+        sigmoid_y = torch.sigmoid(y)
+        z = x * sigmoid_y * y
+        
         out = F.linear(z.to(weight.dtype), weight, bias)
-        # We don't store z, will be recomputed in the backward pass to save memory
-        ctx.save_for_backward(x, y, weight)
+        
+        # 保存反向传播所需的值
+        ctx.save_for_backward(x, y, sigmoid_y, weight)
         ctx.linear_bias_is_none = bias is None
+        
         return out
 
     @staticmethod
     def backward(ctx, dout, *args):
-        x, y, weight = ctx.saved_tensors
+        x, y, sigmoid_y, weight = ctx.saved_tensors
+        
+        # 重塑梯度
         dout = dout.reshape(-1, dout.shape[-1])
+        
+        # 计算 dz
         dz = F.linear(dout, weight.t()).view_as(x)
-        dx, dy, z = swiglu_bwd_with_output(x, y, dz)
+        
+        # SiLU 的导数
+        silu_grad = sigmoid_y + y * sigmoid_y * (1 - sigmoid_y)
+        
+        # 计算梯度
+        dx = dz * sigmoid_y * y
+        dy = dz * x * silu_grad
+        
+        # 计算线性层的梯度
+        z = x * sigmoid_y * y
         dlinear_weight = torch.einsum("bo,bi->oi", dout, z.reshape(-1, z.shape[-1]))
         dlinear_bias = None if ctx.linear_bias_is_none else dout.sum(0)
+        
         return dx, dy, dlinear_weight, dlinear_bias
 
 
+# 使用新的纯 PyTorch 实现
 swiglu = SwiGLUFunction.apply
-
 swiglu_linear = SwiGLULinearFunction.apply
 
 ACT2FN = {
